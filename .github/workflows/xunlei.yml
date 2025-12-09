@@ -1,0 +1,149 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag'
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  TARGET_ARCH: x86_64
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y curl wget git upx rename build-essential
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          source $HOME/.cargo/env
+          rustup default stable
+
+      - name: Install cargo-deb
+        run: |
+          source $HOME/.cargo/env
+          cargo install cargo-deb --locked
+
+      - name: Get tag
+        id: tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: dawidd6/action-get-tag@v1
+        with:
+          strip_v: true
+
+      - name: Set TAG environment variable
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "TAG=${{ github.event.inputs.tag }}" >> $GITHUB_ENV
+          elif [ -n "${{ steps.tag.outputs.tag }}" ]; then
+            echo "TAG=${{ steps.tag.outputs.tag }}" >> $GITHUB_ENV
+          else
+            echo "TAG=latest" >> $GITHUB_ENV
+
+      - name: Build package if build.sh exists
+        shell: bash
+        run: |
+          if [ -f build.sh ]; then
+            chmod +x build.sh
+            ./build.sh
+          else
+            echo "build.sh not found, skipping build"
+          fi
+
+      - name: Upload binaries to GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          token: ${{ secrets.TOKEN }}
+          files: uploads/*
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') }}
+          generate_release_notes: true
+
+      - name: Clean cached packages
+        run: |
+          rm -rf target/$TARGET_ARCH/debian
+          rm -rf target/$TARGET_ARCH/generate-rpm
+
+  openwrt:
+    name: ImmortalWrt Package
+    runs-on: ubuntu-20.04
+    needs: [ linux ]
+    environment: OpenWrt
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - arch: "x86_64"
+            sdk: "https://downloads.immortalwrt.org/releases/24.10.0/targets/x86/64/immortalwrt-sdk-24.10.0-x86-64_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+          - arch: "aarch64_cortex-a72"
+            sdk: "https://downloads.immortalwrt.org/releases/24.10.0/targets/bcm27xx/bcm2711/immortalwrt-sdk-24.10.0-bcm27xx-bcm2711_gcc-13.3.0_musl.Linux-x86_64.tar.zst"
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install build requirements
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ccache ecj fastjar file g++ gawk \
+          gettext git java-propose-classpath libelf-dev libncurses5-dev \
+          libncursesw5-dev libssl-dev python2.7-dev python3 unzip wget \
+          python3-distutils python3-setuptools python3-dev rsync subversion \
+          swig time xsltproc zlib1g-dev zstd
+
+      - name: Install ImmortalWrt SDK (.tar.zst)
+        run: |
+          mkdir -p openwrt-sdk
+          wget -O sdk.tar.zst ${{ matrix.target.sdk }}
+          tar -I zstd -xvf sdk.tar.zst -C openwrt-sdk --strip-components=1
+
+      - name: Build Package
+        run: |
+          echo "src-link xunlei $GITHUB_WORKSPACE/openwrt" > openwrt-sdk/feeds.conf
+          echo 'CONFIG_PACKAGE_xunlei=y
+          CONFIG_PACKAGE_luci-app-xunlei=y
+          ' >> openwrt-sdk/.config
+          cd openwrt-sdk
+          cat feeds.conf.default >> feeds.conf
+          ./scripts/feeds update -a > /dev/null
+          make defconfig
+          ./scripts/feeds install -d y -f -a
+          make package/xunlei/compile V=s
+          make package/luci-app-xunlei/compile V=s
+          tree bin/packages/
+
+      - name: Archive packages
+        uses: actions/upload-artifact@v3
+        with:
+          name: xunlei-launcher-${{ matrix.target.arch }}
+          path: openwrt-sdk/bin/packages/${{ matrix.target.arch }}/xunlei/xunlei*.ipk
+
+      - name: Archive luci packages
+        uses: actions/upload-artifact@v3
+        with:
+          name: xunlei-launcher-luci-${{ matrix.target.arch }}
+          path: openwrt-sdk/bin/packages/${{ matrix.target.arch }}/xunlei/luci-*.ipk
+
+      - name: Upload packages to GitHub Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          token: ${{ secrets.TOKEN }}
+          files: |
+            openwrt-sdk/bin/packages/${{ matrix.target.arch }}/xunlei/xunlei*.ipk
+            openwrt-sdk/bin/packages/${{ matrix.target.arch }}/xunlei/luci-*.ipk
+          generate_release_notes: true
